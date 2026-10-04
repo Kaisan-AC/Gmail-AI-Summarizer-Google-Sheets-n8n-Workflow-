@@ -1,0 +1,334 @@
+{
+  "name": "Gmail AI Summarizer to Google Sheets",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "simple": false,
+        "filters": {
+          "labelIds": [
+            "INBOX"
+          ]
+        },
+        "options": {}
+      },
+      "id": "gmail_trigger",
+      "name": "Gmail Trigger",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "loop_over_items",
+      "name": "Loop Over Items",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        260,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const item = $input.item;\nconst json = item.json || {};\n\nfunction getHeader(headers, name) {\n  const h = (headers || []).find(h => h.name.toLowerCase() === name.toLowerCase());\n  return h ? h.value : '';\n}\n\nfunction base64UrlDecode(data) {\n  if (!data) return '';\n  const base64 = data.replace(/-/g, '+').replace(/_/g, '/');\n  const buff = Buffer.from(base64, 'base64');\n  return buff.toString('utf-8');\n}\n\nfunction extractBodies(payload) {\n  let html = '';\n  let text = '';\n  if (!payload) return { html, text };\n\n  function walk(part) {\n    if (!part) return;\n    const mimeType = part.mimeType || '';\n    if (part.body && part.body.data) {\n      const decoded = base64UrlDecode(part.body.data);\n      if (mimeType === 'text/html') html += decoded;\n      else if (mimeType === 'text/plain') text += decoded;\n    }\n    if (part.parts && part.parts.length) {\n      for (const p of part.parts) walk(p);\n    }\n  }\n\n  walk(payload);\n  return { html, text };\n}\n\nfunction extractAttachmentNames(payload) {\n  const names = [];\n  function walk(part) {\n    if (!part) return;\n    if (part.filename && part.filename.length > 0) {\n      names.push(part.filename);\n    }\n    if (part.parts && part.parts.length) {\n      for (const p of part.parts) walk(p);\n    }\n  }\n  walk(payload);\n  return names;\n}\n\n// The message ID always comes from the original trigger item, even if this\n// particular fetch failed, so the \"Open Gmail\" link always works.\nconst triggerJson = $('Gmail Trigger').item.json;\nconst messageId = json.id || triggerJson.id;\nconst threadId = json.threadId || triggerJson.threadId;\n\nconst fetchFailed = !!json.error || !json.payload;\n\nconst headers = json.payload ? json.payload.headers : [];\nconst from = getHeader(headers, 'From');\nconst subject = getHeader(headers, 'Subject') || (fetchFailed ? '(could not fetch email)' : '(no subject)');\nconst dateHeader = getHeader(headers, 'Date');\n// The real email Message-ID header (e.g. \"<abc123@mail.gmail.com>\"), used to\n// deep-link directly to this message via Gmail's rfc822msgid: search.\nconst rfc822MessageId = getHeader(headers, 'Message-ID') || getHeader(headers, 'Message-Id');\n\nconst { html, text } = extractBodies(json.payload);\nconst bodyHtml = html;\nconst bodyText = text || (bodyHtml ? bodyHtml.replace(/<[^>]+>/g, ' ') : '');\nconst attachmentNames = extractAttachmentNames(json.payload);\n\nlet receivedDate;\nif (json.internalDate) {\n  receivedDate = new Date(Number(json.internalDate)).toISOString();\n} else if (dateHeader) {\n  const parsed = new Date(dateHeader);\n  receivedDate = isNaN(parsed.getTime()) ? new Date().toISOString() : parsed.toISOString();\n} else {\n  receivedDate = new Date().toISOString();\n}\n\nreturn {\n  json: {\n    messageId: messageId,\n    threadId: threadId,\n    rfc822MessageId: rfc822MessageId,\n    sender: from,\n    subject: subject,\n    receivedDate: receivedDate,\n    bodyHtml: bodyHtml,\n    bodyText: bodyText.trim(),\n    attachmentNames: attachmentNames,\n    fetchFailed: fetchFailed\n  }\n};"
+      },
+      "id": "extract_email_data",
+      "name": "Extract Email Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        740,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const item = $input.item;\nconst html = item.json.bodyHtml || '';\nconst text = item.json.bodyText || '';\n\nfunction decodeHtmlEntities(str) {\n  return String(str)\n    .replace(/&amp;/g, '&')\n    .replace(/&lt;/g, '<')\n    .replace(/&gt;/g, '>')\n    .replace(/&quot;/g, '\"')\n    .replace(/&#39;/g, \"'\")\n    .replace(/&apos;/g, \"'\");\n}\n\nconst links = new Set();\n\n// 1) Explicit hyperlinks the sender put in the email: <a href=\"...\">\nconst hrefRegex = /<a\\s+[^>]*href\\s*=\\s*[\"']([^\"']+)[\"'][^>]*>/gi;\nlet match;\nwhile ((match = hrefRegex.exec(html)) !== null) {\n  links.add(decodeHtmlEntities(match[1]));\n}\n\n// 2) Plain URLs written directly in the visible/readable text of the email.\n//    Scan the plain-text body (or HTML with tags stripped), never the raw\n//    HTML markup -- otherwise css/background-image/script/tracking-pixel\n//    URLs baked into the markup get picked up as if they were links.\nconst plainTextSource = text || html.replace(/<[^>]+>/g, ' ');\nconst urlRegex = /https?:\\/\\/[^\\s\"'<>\\)\\]]+/gi;\nlet urlMatch;\nwhile ((urlMatch = urlRegex.exec(plainTextSource)) !== null) {\n  links.add(decodeHtmlEntities(urlMatch[0].replace(/[.,;:!?]+$/, '')));\n}\n\n// 3) Drop anything that isn't genuine sender content: unsubscribe/tracking\n//    links, asset files, social-share/icon links, and platform navigation\n//    chrome (e.g. LinkedIn's header/badge/feed links that appear in every\n//    notification email, carrying tokens like lipi=, midToken=, trk=eml-).\nconst noisePatterns = [\n  /unsubscribe/i,\n  /email-settings/i,\n  /\\bopt-?out\\b/i,\n  /\\/track(ing)?\\//i,\n  /\\bclick\\.[^/]+\\//i,\n  /\\bmailtrack\\b/i,\n  /list-manage\\.com/i,\n  /sendgrid\\.net\\/wf\\//i,\n  /hubspotlinks\\.com/i,\n  /mailerlite\\.com\\/track/i,\n  /googleusercontent\\.com/i,\n  /gstatic\\.com/i,\n  /fonts\\.googleapis\\.com/i,\n  /w3\\.org/i,\n  /schema\\.org/i,\n  /facebook\\.com\\/(sharer|share)/i,\n  /twitter\\.com\\/(intent|share)/i,\n  /linkedin\\.com\\/(shareArticle|share)/i,\n  /wa\\.me\\//i,\n  /\\.(png|jpe?g|gif|svg|webp|ico|css|js|woff2?|ttf)(\\?|$)/i,\n  // platform email-template navigation/tracking chrome, not sender content\n  /[?&]lipi=/i,\n  /[?&]midToken=/i,\n  /[?&]midSig=/i,\n  /[?&]otpToken=/i,\n  /[?&]trkEmail=/i,\n  /[?&]trk=eml-/i,\n  /linkedin\\.com\\/comm\\//i,\n  /linkedin\\.com\\/e\\/v2\\//i,\n  /linkedin\\.com\\/psettings\\//i,\n  /linkedin\\.com\\/notifications\\//i\n];\n\nconst contentLinks = [...links].filter(link => {\n  // Very long, heavily-tokenized URLs are almost always auto-generated\n  // tracking/navigation links rather than something a person typed or pasted.\n  const isExcessivelyLong = link.length > 180;\n  const isNoise = noisePatterns.some(pattern => pattern.test(link));\n  return !isNoise && !isExcessivelyLong;\n});\n\nconst uniqueLinks = [...new Set(contentLinks)];\n\nreturn {\n  json: {\n    ...item.json,\n    links: uniqueLinks,\n    linksJoined: uniqueLinks.join('\\n')\n  }\n};"
+      },
+      "id": "extract_links",
+      "name": "Extract Links",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        980,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const item = $input.item;\nconst json = item.json;\nconst attachmentNames = json.attachmentNames || [];\n\nconst body = (json.bodyText || '').slice(0, 6000);\nconst links = json.links || [];\n\nconst systemPrompt = `You are an assistant that reads emails and produces a concise, factual summary. Only use information present in the email. Respond with ONLY a valid JSON object, no markdown, no code fences, matching exactly this shape:\n{\"summary\": \"string\", \"priority\": \"Low|Medium|High\", \"action_items\": [\"string\"], \"deadline\": \"string or null\"}\nRules:\n- summary: 1-3 sentences, concise, explains what the email is about, mentions important requests, deadlines, and required actions.\n- priority: your best estimate of urgency based on content.\n- action_items: short list of concrete actions the recipient should take, empty array if none.\n- deadline: a date or timeframe mentioned in the email, or null if none.\n- Never invent information not present in the email.`;\n\nconst userPrompt = `Sender: ${json.sender}\nSubject: ${json.subject}\nAttachments: ${attachmentNames.length ? attachmentNames.join(', ') : 'None'}\nLinks found: ${links.length ? links.join(', ') : 'None'}\n\nEmail body:\n${body || '(empty body)'}`;\n\nreturn {\n  json: {\n    ...json,\n    aiSystemPrompt: systemPrompt,\n    aiUserPrompt: userPrompt\n  }\n};"
+      },
+      "id": "build_ai_prompt",
+      "name": "Build AI Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1220,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpQueryAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ systemInstruction: { parts: [ { text: $json.aiSystemPrompt } ] }, contents: [ { role: \"user\", parts: [ { text: $json.aiUserPrompt } ] } ], generationConfig: { temperature: 0.2, responseMimeType: \"application/json\" } }) }}",
+        "options": {}
+      },
+      "id": "ai_summarize",
+      "name": "AI Summarize",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1460,
+        0
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const aiItem = $input.item;\nconst sourceItem = $('Build AI Prompt').item;\nconst source = sourceItem.json;\n\nlet summary = '';\nlet priority = 'Low';\nlet actionItems = [];\nlet deadline = null;\n\nconst aiError = aiItem.json && aiItem.json.error;\n\nif (!aiError) {\n  try {\n    const candidates = aiItem.json && aiItem.json.candidates;\n    const content = (candidates && candidates[0] && candidates[0].content && candidates[0].content.parts && candidates[0].content.parts[0])\n      ? candidates[0].content.parts[0].text\n      : '';\n    const cleaned = String(content).replace(/```json/gi, '').replace(/```/g, '').trim();\n    const parsed = JSON.parse(cleaned);\n    summary = parsed.summary || '';\n    priority = parsed.priority || 'Low';\n    actionItems = Array.isArray(parsed.action_items) ? parsed.action_items : [];\n    deadline = parsed.deadline || null;\n  } catch (e) {\n    summary = 'AI summary unavailable (could not parse model response).';\n  }\n} else {\n  const errMsg = (aiError && (aiError.message || JSON.stringify(aiError))) || 'unknown error';\n  summary = `AI summary unavailable (request failed: ${errMsg})`;\n}\n\nif (!summary) {\n  summary = 'No summary generated.';\n}\n\nreturn {\n  json: {\n    messageId: source.messageId,\n    threadId: source.threadId,\n    rfc822MessageId: source.rfc822MessageId,\n    sender: source.sender,\n    subject: source.subject,\n    receivedDate: source.receivedDate,\n    links: source.links || [],\n    linksJoined: source.linksJoined || '',\n    attachmentNames: source.attachmentNames || [],\n    summary: summary,\n    priority: priority,\n    actionItems: actionItems,\n    deadline: deadline\n  }\n};"
+      },
+      "id": "parse_ai_response",
+      "name": "Parse AI Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1700,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const json = $json;\n\nconst dateObj = json.receivedDate ? new Date(json.receivedDate) : new Date();\nconst dateFormatted = dateObj.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });\n\nlet gmailUrl;\nif (json.rfc822MessageId) {\n  // Gmail reads the URL fragment (#search/...) directly as literal text --\n  // it is never sent to a server and never URL-decoded by Gmail's client JS.\n  // encodeURIComponent() would turn \":\" and \"@\" into %3A/%40, which breaks\n  // Gmail's rfc822msgid: operator recognition, so we deliberately leave the\n  // Message-ID unencoded here.\n  const cleanId = String(json.rfc822MessageId).replace(/^</, '').replace(/>$/, '').trim();\n  gmailUrl = `https://mail.google.com/mail/u/0/#search/rfc822msgid:${cleanId}`;\n} else {\n  gmailUrl = `https://mail.google.com/mail/u/0/#all/${json.threadId || json.messageId}`;\n}\nconst openGmailFormula = `=HYPERLINK(\"${gmailUrl}\",\"\\ud83d\\udce7 Open Gmail\")`;\n\nconst attachmentNames = json.attachmentNames || [];\nconst attachmentsColumn = attachmentNames.length\n  ? `Yes: ${attachmentNames.join(', ')}`\n  : 'None';\n\nfunction wrapEveryNWords(text, n) {\n  const words = String(text || '').split(/\\s+/).filter(Boolean);\n  const lines = [];\n  for (let i = 0; i < words.length; i += n) {\n    lines.push(words.slice(i, i + n).join(' '));\n  }\n  return lines.join('\\n');\n}\n\nconst wrappedSummary = wrapEveryNWords(json.summary, 8);\nconst wrappedSubject = wrapEveryNWords(json.subject, 8);\n\nreturn {\n  json: {\n    date: dateFormatted,\n    sender: json.sender || '',\n    subject: wrappedSubject,\n    summary: wrappedSummary,\n    links: json.linksJoined || (json.links ? json.links.join('\\n') : ''),\n    attachments: attachmentsColumn,\n    openGmail: openGmailFormula,\n    messageId: json.messageId || '',\n    processedAt: new Date().toISOString()\n  }\n};"
+      },
+      "id": "build_sheet_row",
+      "name": "Build Sheet Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1940,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "sheet",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REPLACE_WITH_YOUR_GOOGLE_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Sheet1"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Date": "={{ $json.date }}",
+            "Sender": "={{ $json.sender }}",
+            "Subject": "={{ $json.subject }}",
+            "Summary": "={{ $json.summary }}",
+            "Links": "={{ $json.links }}",
+            "Attachments": "={{ $json.attachments }}",
+            "Open Gmail": "={{ $json.openGmail }}",
+            "Message ID": "={{ $json.messageId }}",
+            "Processed At": "={{ $json.processedAt }}"
+          },
+          "matchingColumns": [
+            "Message ID"
+          ],
+          "schema": []
+        },
+        "options": {
+          "cellFormat": "USER_ENTERED"
+        }
+      },
+      "id": "append_to_google_sheet",
+      "name": "Append to Google Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        2180,
+        0
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "done",
+      "name": "Done",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        500,
+        -220
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://gmail.googleapis.com/gmail/v1/users/me/messages/{{ $json.id }}?format=full",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "gmailOAuth2",
+        "options": {}
+      },
+      "id": "get_full_email",
+      "name": "Get Full Email",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        500,
+        0
+      ],
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Gmail Trigger": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [
+          {
+            "node": "Done",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Get Full Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Email Data": {
+      "main": [
+        [
+          {
+            "node": "Extract Links",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Links": {
+      "main": [
+        [
+          {
+            "node": "Build AI Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build AI Prompt": {
+      "main": [
+        [
+          {
+            "node": "AI Summarize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Summarize": {
+      "main": [
+        [
+          {
+            "node": "Parse AI Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse AI Response": {
+      "main": [
+        [
+          {
+            "node": "Build Sheet Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Sheet Row": {
+      "main": [
+        [
+          {
+            "node": "Append to Google Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append to Google Sheet": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Full Email": {
+      "main": [
+        [
+          {
+            "node": "Extract Email Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}
